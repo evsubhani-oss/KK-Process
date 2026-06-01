@@ -1298,7 +1298,7 @@ if st.session_state.analysis_complete and app_mode != "ℹ️ About / Help":
         with tab1:
             if not df_kpi.empty:
                 # Format Dates for cleaner X-Axis
-                df_kpi['Date'] = pd.to_datetime(df_kpi['Date'], errors='ignore').dt.strftime('%Y-%m-%d')
+                df_kpi['Date'] = pd.to_datetime(df_kpi['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
                 
                 unique_paths = sorted(df_kpi['Path'].astype(str).unique())
                 selected_path = st.selectbox("📍 Select Route to Analyze", unique_paths)
