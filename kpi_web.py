@@ -130,7 +130,6 @@ def load_master_data(master_file, status_log):
                 if s_date and e_date:
                     times_series = col_data.iloc[3:]
                 else:
-                    # Fallback if no dates present in row 1 and 2 (Legacy Support)
                     s_date, e_date = pd.to_datetime('2000-01-01').date(), pd.to_datetime('2099-12-31').date()
                     times_series = col_data.iloc[1:]
                     
@@ -482,7 +481,7 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
             "invalid_stops_log": [], "path_statistics_log": [], "auto_rush": [], "sanity_checks": sanity_log, 
             "raw_sanity_checks": raw_sanity_log, "raw_strict_late_log": [], "raw_cleaning": [], 
             "raw_obu": [], "raw_bunched": [], "raw_accepted": [], "raw_on_time": [], 
-            "raw_off_time": [], "raw_reg_regular": [], "raw_reg_irregular": []
+            "raw_off_time": [], "raw_reg_regular": [], "raw_reg_irregular": [], "ignored_trips": []
         }
     # ---------------------------------------------------
         
@@ -682,21 +681,8 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
         for (d, p), count in intimations_dict.items():
             if count < 0 and p == normalize_path(directional_path): fast_quotas[d] = abs(count)
 
-    for _, r in df_clean.iterrows():
-        link = make_tracking_url(r['Bus_ID'], r['Sched_DT'], r['End_DT'], display_text=r['Schedule_Time'])
-        status = r['Punctuality_Status']
-        trip_log.append({
-            "Date": r['Date'], "Path": directional_path, "Bus_ID": r['Bus_ID'],
-            "Original OBU Schedule": r['Schedule_Time'], "Corrected Schedule": r['Corrected_Sched_DT'],
-            "Actual Departure": r['Actual_DT'], "Is Imputed Start": r.get('Is_Imputed', False),
-            "Headway (Mins)": round(r['Headway_Mins'], 2) if pd.notna(r['Headway_Mins']) else None,
-            "Delay (%)": round(r['Delay_Pct'], 2) if pd.notna(r['Delay_Pct']) else None,
-            "Status": status, "Tracking Link": link
-        })
-        
-        if status == "On-Time": raw_on_time.append(make_raw(r, "On-Time", link))
-        elif status in ["Early", "Late"]: raw_off_time.append(make_raw(r, status, link))
-        
+    # Initial Regularity Status Assignment
+    for idx, r in df_clean.iterrows():
         tt = r['Actual_Travel_Time_Mins']
         reg_status = "Unknown"
         act_time = r['Actual_DT'].time() if pd.notna(r['Actual_DT']) else None
@@ -737,8 +723,78 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
             if target_time is None: reg_status = "Missing Target Time"
             else: reg_status = "Missing Travel Time"
 
-        df_clean.at[r.name, 'Regularity_Status'] = reg_status
+        df_clean.at[idx, 'Regularity_Status'] = reg_status
+
+    # Apply Auto-Rush & Bunching Exclusions
+    for date_val, group in df_clean.groupby('Date'):
+        # 1. Punctuality Bunching Exemption
+        sched_counts = group['Corrected_Sched_DT'].value_counts()
+        bunched_times = sched_counts[sched_counts > 1].index
+        for st_val in bunched_times:
+            bunch_group = group[group['Corrected_Sched_DT'] == st_val]
+            # Identify the single trip with the absolute minimum delay to keep evaluating
+            best_idx = bunch_group['Delay_Mins'].abs().idxmin()
+            for idx in bunch_group.index:
+                if idx != best_idx:
+                    df_clean.at[idx, 'Punctuality_Status'] = "Bunched (Excluded)"
         
+        # 2. Auto Rush Hour Exemption
+        if params["auto_rush_enable"]:
+            group_sorted = df_clean[df_clean['Date'] == date_val].sort_values(by=['Corrected_Sched_DT', 'Actual_DT'])
+            consec_indices = []
+            for idx, r in group_sorted.iterrows():
+                if r['Regularity_Status'] in ["Too Slow", "Rush Hour Excluded (Slow)"]:
+                    consec_indices.append(idx)
+                else:
+                    if len(consec_indices) >= params["auto_rush_thresh"]:
+                        for ci in consec_indices:
+                            if df_clean.at[ci, 'Regularity_Status'] == "Too Slow":
+                                df_clean.at[ci, 'Regularity_Status'] = "Auto Rush Excluded (Slow)"
+                    consec_indices = []
+            if len(consec_indices) >= params["auto_rush_thresh"]:
+                for ci in consec_indices:
+                    if df_clean.at[ci, 'Regularity_Status'] == "Too Slow":
+                        df_clean.at[ci, 'Regularity_Status'] = "Auto Rush Excluded (Slow)"
+
+    ignored_trips_log = []
+
+    # Final Extraction & Detail Logging
+    for _, r in df_clean.iterrows():
+        link = make_tracking_url(r['Bus_ID'], r['Sched_DT'], r['End_DT'], display_text=r['Schedule_Time'])
+        punct_status = r['Punctuality_Status']
+        reg_status = r['Regularity_Status']
+        
+        # Determine if Ignored
+        is_ignored = False
+        reasons = []
+        if "(Excluded)" in punct_status:
+            is_ignored = True
+            reasons.append(f"Punctuality: {punct_status}")
+        if "(Excluded)" in reg_status:
+            is_ignored = True
+            reasons.append(f"Regularity: {reg_status}")
+            
+        if is_ignored:
+            ignored_trips_log.append({
+                "Date": r['Date'], "Path": directional_path, "Bus_ID": r['Bus_ID'],
+                "Original Schedule": r['Schedule_Time'], "Corrected Schedule": r['Corrected_Sched_DT'],
+                "Actual Departure": r['Actual_DT'], "Ignored Reason": " | ".join(reasons),
+                "Tracking Link": link
+            })
+            
+        trip_log.append({
+            "Date": r['Date'], "Path": directional_path, "Bus_ID": r['Bus_ID'],
+            "Original OBU Schedule": r['Schedule_Time'], "Corrected Schedule": r['Corrected_Sched_DT'],
+            "Actual Departure": r['Actual_DT'], "Is Imputed Start": r.get('Is_Imputed', False),
+            "Headway (Mins)": round(r['Headway_Mins'], 2) if pd.notna(r['Headway_Mins']) else None,
+            "Delay (%)": round(r['Delay_Pct'], 2) if pd.notna(r['Delay_Pct']) else None,
+            "Status": punct_status, "Tracking Link": link
+        })
+        
+        if punct_status == "On-Time": raw_on_time.append(make_raw(r, "On-Time", link))
+        elif punct_status in ["Early", "Late"]: raw_off_time.append(make_raw(r, punct_status, link))
+        
+        tt = r['Actual_Travel_Time_Mins']
         trip_reg_log.append({
             "Date": r['Date'], "Path": directional_path, "Bus_ID": r['Bus_ID'],
             "OBU Schedule": r['Schedule_Time'], "Corrected Schedule": r['Corrected_Sched_DT'],
@@ -749,8 +805,8 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
         })
         
         if reg_status in ["Regular", "Regular (Approved Fast)"]: raw_reg_regular.append(make_raw(r, f"{reg_status} Travel Time", link))
-        elif reg_status in ["Too Fast", "Too Slow", "Impossible Time (Excluded)", "Distance Outlier (Excluded)", "Incomplete Route (Excluded)", "Rush Hour Excluded (Slow)"]: 
-            raw_reg_irregular.append(make_raw(r, reg_status, link))
+        elif reg_status in ["Too Fast", "Too Slow"]: raw_reg_irregular.append(make_raw(r, reg_status, link))
+
 
     e_up, e_tgt, e_bot = params["eff_upper"], params["eff_target"], params["eff_bottom"]
     pen_high, pen_low = params["eff_pen_high"], params["eff_pen_low"]
@@ -767,10 +823,10 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
         
         consecutive_slow = []
         for _, r in group.iterrows():
-            if r['Regularity_Status'] == "Too Slow":
+            if r['Regularity_Status'] in ["Too Slow", "Auto Rush Excluded (Slow)"]:
                 consecutive_slow.append(r)
             else:
-                if len(consecutive_slow) > 1:
+                if len(consecutive_slow) >= params["auto_rush_thresh"]:
                     st_time = consecutive_slow[0]['Actual_DT'].strftime('%H:%M:%S')
                     en_time = consecutive_slow[-1]['Actual_DT'].strftime('%H:%M:%S')
                     trip_links = [make_tracking_url(x['Bus_ID'], x['Sched_DT'], x['End_DT'], display_text=x['Schedule_Time'], raw_url_only=True) for x in consecutive_slow]
@@ -780,7 +836,7 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
                     })
                 consecutive_slow = []
                 
-        if len(consecutive_slow) > 1:
+        if len(consecutive_slow) >= params["auto_rush_thresh"]:
             st_time = consecutive_slow[0]['Actual_DT'].strftime('%H:%M:%S')
             en_time = consecutive_slow[-1]['Actual_DT'].strftime('%H:%M:%S')
             trip_links = [make_tracking_url(x['Bus_ID'], x['Sched_DT'], x['End_DT'], display_text=x['Schedule_Time'], raw_url_only=True) for x in consecutive_slow]
@@ -1008,7 +1064,8 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
         "auto_rush": auto_rush_periods_log, "sanity_checks": [], "raw_sanity_checks": [],
         "raw_strict_late_log": raw_strict_late_log, "raw_cleaning": raw_cleaning, 
         "raw_obu": raw_obu, "raw_bunched": raw_bunched, "raw_accepted": raw_accepted, "raw_on_time": raw_on_time, 
-        "raw_off_time": raw_off_time, "raw_reg_regular": raw_reg_regular, "raw_reg_irregular": raw_reg_irregular
+        "raw_off_time": raw_off_time, "raw_reg_regular": raw_reg_regular, "raw_reg_irregular": raw_reg_irregular,
+        "ignored_trips": ignored_trips_log
     }
 
 # ================= UI AND EXECUTION =================
@@ -1043,27 +1100,31 @@ if app_mode == "ℹ️ About / Help":
         * **Target:** `Total Assigned Schedules - Intimations`
         * **Operated:** Valid trips recorded. If `Strict Mode` is on, trips delayed >50% of headway are deducted.
         * **Bunching Deduction:** Trips occurring simultaneously on the same schedule slot are penalized as bunched, unless covered by negative intimations.
-        * **Penalty:** `(Deficit Volume) * Penalty Factor`. The factor varies depending on whether you hit the Target/Bottom thresholds.
+        * **Penalty:** `(Deficit Volume + Bunched Trips) * Penalty Factor`. The factor varies depending on whether you hit the Target/Bottom thresholds.
 
         **2. Punctuality (Timing)**
         * Evaluates the delay against the *Corrected Schedule* (the closest actual master schedule to the departure time, fixing driver OBU errors).
         * **Tolerances:** Can be fixed minutes (e.g., -2 to +5) or a dynamic percentage of the scheduled headway (e.g., 20%).
+        * **Bunching Exemption:** If multiple trips are bunched on the same schedule, the most punctual one is evaluated normally. The extra bunched trips are excluded from punctuality penalties (since they are already penalized in Efficiency).
         * **Penalty:** Fixed penalty amount applied per Early or Late trip.
 
         **3. Regularity (Travel Time)**
         * Travel time is evaluated against the `Total Time` master sheet.
         * **Classifications:** Regular, Too Fast, Too Slow.
-        * **Exemptions:** Slow trips occurring during `Rush Hours` are exempted. 'Approved Fast' quotas can exempt slightly fast trips based on intimations.
+        * **Exemptions:** * Slow trips occurring during explicitly defined `Rush Hours` are exempted. 
+            * **Auto-Rush Detection:** If enabled, any chain of consecutive slow trips (exceeding your threshold, default 3) is automatically exempted.
+            * 'Approved Fast' quotas can exempt slightly fast trips based on intimations.
         * **Penalty:** Fixed penalty amount per Irregular trip.
         """)
 
     with st.expander("🛡️ Edge Cases & Data Cleaning"):
         st.markdown("""
+        * **Ignored Trips Sheet:** Any trip that is exempted from KPI penalties (due to Imputation, Outlier status, Auto-Rush, or Bunching Exemption) is filtered out of your main impactful KPI detail sheets and aggregated in the `IGNORED_TRIPS` sheet for your review.
         * **Distance Outliers:** Trips with `REALIZED_KM` < minimum are dropped. Outliers (> Mean + 3*StdDev) are excluded from regularity calculations. Distances > 2.5x the mode are counted as double trips (Weight = 2).
         * **Ghost Trips:** Trips with fewer stops than the minimum threshold are ignored.
         * **Imputed Start Times:** If a trip lacks an explicit start time but has a planned schedule, the system retroactively imputes the start time based on the timestamp of the first recorded stop minus the expected duration to reach that stop.
         * **OBU Auto-Correction:** If a driver selects an incorrect schedule on the OBU (e.g., 06:00 instead of 06:15), the system automatically matches their actual departure time to the closest real schedule from the Master File to prevent false penalties.
-        
+        * **Date Rollovers:** Night shift times (e.g., past midnight) are automatically shifted by +1 day based on a 12-hour proximity check against the target schedule.
         """)
 
 elif app_mode == "📊 View Existing Dashboard":
@@ -1107,6 +1168,9 @@ elif app_mode == "🛠️ Process New Data":
             p_reg_imp_fast = st.number_input("Impossible Fast Limit (< %)", value=60.0)
             p_reg_imp_slow = st.number_input("Impossible Slow Limit (> %)", value=60.0)
             p_reg_pen = st.number_input("Penalty Per Irregular Trip", value=50.0, key="r3")
+            st.caption("Auto-Rush Detection:")
+            p_auto_rush = st.checkbox("Auto-Ignore Extended Rush Hours", value=True)
+            p_auto_rush_thresh = st.number_input("Consecutive Slow Trips Threshold", value=3, min_value=1)
 
         with st.expander("Data Cleaning"):
             p_min_km = st.number_input("Minimum Valid REALIZED_KM", value=1.5)
@@ -1119,6 +1183,7 @@ elif app_mode == "🛠️ Process New Data":
         "early_limit": p_early_limit, "late_limit": p_late_limit, "punct_pen": p_punct_pen, "reg_upper": p_reg_upper,
         "reg_bottom": p_reg_bottom, "reg_fast_pct": p_reg_fast_pct, "reg_slow_pct": p_reg_slow_pct, 
         "reg_imp_fast_pct": p_reg_imp_fast, "reg_imp_slow_pct": p_reg_imp_slow, "reg_pen": p_reg_pen,
+        "auto_rush_enable": p_auto_rush, "auto_rush_thresh": p_auto_rush_thresh,
         "min_km": p_min_km, "min_stops": p_min_stops, "run_sanity_checks": False
     }
 
@@ -1146,7 +1211,7 @@ elif app_mode == "🛠️ Process New Data":
                     "KPI_SUMMARY": [], "EFFICIENCY_DETAILS": [], "PUNCTUALITY_DETAILS": [], "REGULARITY_DETAILS": [],
                     "OBU_SELECTION_ERRORS": [], "ASSIGNED_TRIPS": [], "ACCEPTED_TRIPS": [], "BUNCHED_TRIPS": [], "MISSED_TRIPS": [], 
                     "STRICT_EFFICIENCY_DEDUCTIONS": [], "AUTO_DETECTED_RUSH": [], "STIO_SANITY_CHECKS": [], "ON_TIME_TRIPS": [], "OFF_TIME_TRIPS": [], 
-                    "REGULAR_TIME_TRIPS": [], "IRREGULAR_TIME_TRIPS": [], "DATA_CLEANING_LOG": [], "INVALID_STOP_TIMES": [], 
+                    "REGULAR_TIME_TRIPS": [], "IRREGULAR_TIME_TRIPS": [], "IGNORED_TRIPS": [], "DATA_CLEANING_LOG": [], "INVALID_STOP_TIMES": [], 
                     "PATH_STATISTICS": []
                 }
                 raw_master_data = {
@@ -1174,15 +1239,16 @@ elif app_mode == "🛠️ Process New Data":
                         master_data["DATA_CLEANING_LOG"].extend(res.get("cleaning", []))
                         master_data["INVALID_STOP_TIMES"].extend(res.get("invalid_stops_log", []))
                         master_data["PATH_STATISTICS"].extend(res.get("path_statistics_log", []))
+                        master_data["IGNORED_TRIPS"].extend(res.get("ignored_trips", []))
                         
+                        # Only append impactful trips to the detail sheets
                         for trip in res.get("trips", []):
                             if trip["Status"] == "On-Time": master_data["ON_TIME_TRIPS"].append(trip)
                             elif trip["Status"] in ["Early", "Late"]: master_data["OFF_TIME_TRIPS"].append(trip)
                             
                         for trip in res.get("reg_trips", []):
                             if trip["Status"] in ["Regular", "Regular (Approved Fast)"]: master_data["REGULAR_TIME_TRIPS"].append(trip)
-                            elif trip["Status"] in ["Too Fast", "Too Slow", "Impossible Time (Excluded)", "Distance Outlier (Excluded)", "Incomplete Route (Excluded)", "Rush Hour Excluded (Slow)"]: 
-                                master_data["IRREGULAR_TIME_TRIPS"].append(trip)
+                            elif trip["Status"] in ["Too Fast", "Too Slow"]: master_data["IRREGULAR_TIME_TRIPS"].append(trip)
                             
                         raw_master_data["RAW_CLEANING_LOG"].extend(res.get("raw_cleaning", []))
                         raw_master_data["RAW_SANITY_CHECKS"].extend(res.get("raw_sanity_checks", []))
