@@ -58,7 +58,8 @@ if uploaded_files:
                     df_summ = df_summ_raw.set_index(0).T
                     df_summ = df_summ.drop(columns=[c for c in df_summ.columns if str(c).startswith("Go To ") or c == " " or c == "-- QUICK NAVIGATION --"], errors='ignore')
                     for col in df_summ.columns:
-                        df_summ[col] = pd.to_numeric(df_summ[col], errors='ignore')
+                        if col != "Date" and col != "Path":
+                            df_summ[col] = pd.to_numeric(df_summ[col], errors='coerce')
                     kpi_summaries.append(df_summ)
                 
                 if "REGULARITY_DETAILS" in xls.sheet_names:
