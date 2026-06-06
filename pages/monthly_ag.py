@@ -21,7 +21,7 @@ with st.sidebar:
     
     st.subheader("1. Efficiency (Volume)")
     thresh_eff = st.number_input("Efficiency Threshold (%)", value=98.0, step=0.1)
-    rate_eff = st.number_input("Penalty per Missed Trip (Volume Deficit)", value=50.0, step=5.0)
+    rate_eff = st.number_input("Penalty per Missed Trip (Volume Deficit)", value=40.0, step=5.0)
     
     st.subheader("2. Bunching (Always Applied)")
     p_exempt_bunching = st.checkbox("Exempt Bunching Penalties caused by Imputed Trips", value=False)
