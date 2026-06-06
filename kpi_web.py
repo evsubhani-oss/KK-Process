@@ -1191,7 +1191,7 @@ elif app_mode == "🛠️ Process New Data":
     with st.sidebar:
         st.header("⚙️ Dashboard Parameters")
         with st.expander("Trip Efficiency Parameters"):
-            p_strict_eff = st.checkbox("Enable Strict Efficiency (Deduct >50% Late)", value=False)
+            p_strict_eff = 1
             p_eff_upper = st.number_input("Upper Threshold (No Penalty >= %)", value=98.0)
             p_eff_target = st.number_input("Target Threshold (%)", value=91.0)
             p_eff_bottom = st.number_input("Bottom Limit (< %)", value=80.0)
