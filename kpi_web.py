@@ -116,7 +116,6 @@ def load_master_data(master_file, status_log):
             xls = pd.ExcelFile(master_file)
             df_sched = pd.read_excel(xls, sheet_name='Scheduled Times' if 'Scheduled Times' in xls.sheet_names else 0, header=None)
             
-        # Parse schedules with date dependencies
         for col_idx in range(df_sched.shape[1]):
             col_data = df_sched.iloc[:, col_idx]
             path_val = str(col_data.iloc[0]).strip()
@@ -182,16 +181,26 @@ def load_master_data(master_file, status_log):
             if 'Rush Hours' in xls.sheet_names:
                 df_rush = pd.read_excel(xls, sheet_name='Rush Hours')
                 df_rush.columns = [str(c).strip() for c in df_rush.columns]
+                
+                def parse_time_safe(val):
+                    if pd.isna(val): return None
+                    if isinstance(val, datetime.time): return val
+                    if isinstance(val, datetime): return val.time()
+                    try: return pd.to_datetime(str(val)).time()
+                    except: return None
+                
                 if set(['Date', 'Path', 'Start Time', 'End Time']).issubset(df_rush.columns):
                     for _, r in df_rush.iterrows():
                         if pd.notna(r['Date']) and pd.notna(r['Start Time']) and pd.notna(r['End Time']):
                             try:
                                 d = pd.to_datetime(r['Date']).date()
                                 p = normalize_path(r['Path'])
-                                st_time = pd.to_datetime(f"{d} {str(r['Start Time']).strip()}").time()
-                                et = pd.to_datetime(f"{d} {str(r['End Time']).strip()}").time()
-                                if (d, p) not in rush_hours_dict: rush_hours_dict[(d, p)] = []
-                                rush_hours_dict[(d, p)].append((st_time, et))
+                                st_time = parse_time_safe(r['Start Time'])
+                                et = parse_time_safe(r['End Time'])
+                                
+                                if st_time is not None and et is not None:
+                                    if (d, p) not in rush_hours_dict: rush_hours_dict[(d, p)] = []
+                                    rush_hours_dict[(d, p)].append((st_time, et))
                             except: pass
 
             if 'VTS' in xls.sheet_names:
@@ -681,7 +690,6 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
         for (d, p), count in intimations_dict.items():
             if count < 0 and p == normalize_path(directional_path): fast_quotas[d] = abs(count)
 
-    # Initial Regularity Status Assignment
     for idx, r in df_clean.iterrows():
         tt = r['Actual_Travel_Time_Mins']
         reg_status = "Unknown"
@@ -725,46 +733,40 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
 
         df_clean.at[idx, 'Regularity_Status'] = reg_status
 
-    # Apply Auto-Rush & Bunching Exclusions
     for date_val, group in df_clean.groupby('Date'):
-        # 1. Punctuality Bunching Exemption
         sched_counts = group['Corrected_Sched_DT'].value_counts()
         bunched_times = sched_counts[sched_counts > 1].index
         for st_val in bunched_times:
             bunch_group = group[group['Corrected_Sched_DT'] == st_val]
-            # Identify the single trip with the absolute minimum delay to keep evaluating
             best_idx = bunch_group['Delay_Mins'].abs().idxmin()
             for idx in bunch_group.index:
                 if idx != best_idx:
                     df_clean.at[idx, 'Punctuality_Status'] = "Bunched (Excluded)"
         
-        # 2. Auto Rush Hour Exemption
-        if params["auto_rush_enable"]:
+        if params.get("auto_rush_enable", True):
             group_sorted = df_clean[df_clean['Date'] == date_val].sort_values(by=['Corrected_Sched_DT', 'Actual_DT'])
             consec_indices = []
             for idx, r in group_sorted.iterrows():
                 if r['Regularity_Status'] in ["Too Slow", "Rush Hour Excluded (Slow)"]:
                     consec_indices.append(idx)
                 else:
-                    if len(consec_indices) >= params["auto_rush_thresh"]:
+                    if len(consec_indices) >= params.get("auto_rush_thresh", 3):
                         for ci in consec_indices:
                             if df_clean.at[ci, 'Regularity_Status'] == "Too Slow":
                                 df_clean.at[ci, 'Regularity_Status'] = "Auto Rush Excluded (Slow)"
                     consec_indices = []
-            if len(consec_indices) >= params["auto_rush_thresh"]:
+            if len(consec_indices) >= params.get("auto_rush_thresh", 3):
                 for ci in consec_indices:
                     if df_clean.at[ci, 'Regularity_Status'] == "Too Slow":
                         df_clean.at[ci, 'Regularity_Status'] = "Auto Rush Excluded (Slow)"
 
     ignored_trips_log = []
 
-    # Final Extraction & Detail Logging
     for _, r in df_clean.iterrows():
         link = make_tracking_url(r['Bus_ID'], r['Sched_DT'], r['End_DT'], display_text=r['Schedule_Time'])
         punct_status = r['Punctuality_Status']
         reg_status = r['Regularity_Status']
         
-        # Determine if Ignored
         is_ignored = False
         reasons = []
         if "(Excluded)" in punct_status:
@@ -822,11 +824,11 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
         bunched_times = sched_counts[sched_counts > 1].index
         
         consecutive_slow = []
-        for _, r in group.iterrows():
-            if r['Regularity_Status'] in ["Too Slow", "Auto Rush Excluded (Slow)"]:
+        for _, r in group.sort_values(by=['Corrected_Sched_DT', 'Actual_DT']).iterrows():
+            if r['Regularity_Status'] in ["Too Slow", "Auto Rush Excluded (Slow)", "Rush Hour Excluded (Slow)"]:
                 consecutive_slow.append(r)
             else:
-                if len(consecutive_slow) >= params["auto_rush_thresh"]:
+                if len(consecutive_slow) >= params.get("auto_rush_thresh", 3):
                     st_time = consecutive_slow[0]['Actual_DT'].strftime('%H:%M:%S')
                     en_time = consecutive_slow[-1]['Actual_DT'].strftime('%H:%M:%S')
                     trip_links = [make_tracking_url(x['Bus_ID'], x['Sched_DT'], x['End_DT'], display_text=x['Schedule_Time'], raw_url_only=True) for x in consecutive_slow]
@@ -836,7 +838,7 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
                     })
                 consecutive_slow = []
                 
-        if len(consecutive_slow) >= params["auto_rush_thresh"]:
+        if len(consecutive_slow) >= params.get("auto_rush_thresh", 3):
             st_time = consecutive_slow[0]['Actual_DT'].strftime('%H:%M:%S')
             en_time = consecutive_slow[-1]['Actual_DT'].strftime('%H:%M:%S')
             trip_links = [make_tracking_url(x['Bus_ID'], x['Sched_DT'], x['End_DT'], display_text=x['Schedule_Time'], raw_url_only=True) for x in consecutive_slow]
@@ -952,8 +954,20 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
         uncovered_slots_count = assigned_count_raw - covered_slots_count
         bunched_trips_count = operated_count_gross - covered_slots_count
         
+        # --- BUNCHING EXEMPTION LOGIC ---
         extra_approved = abs(intimations) if intimations < 0 else 0
-        penalized_bunched_trips = max(0, bunched_trips_count - extra_approved)
+        base_penalized_bunched_trips = max(0, bunched_trips_count - extra_approved)
+        
+        potential_imputed_bunching_count = 0
+        for st_val in operated_schedules:
+            matching_trips = group[group['Corrected_Sched_DT'] == st_val]
+            # If the slot is bunched and AT LEAST ONE trip is imputed
+            if len(matching_trips) > 1 and matching_trips['Is_Imputed'].any():
+                slot_gross = matching_trips['Trip_Weight'].sum()
+                potential_imputed_bunching_count += max(0, slot_gross - 1)
+                
+        applied_bunching_exemptions = potential_imputed_bunching_count if params.get("exempt_imputed_bunching") else 0
+        penalized_bunched_trips = max(0, bunched_trips_count - extra_approved - applied_bunching_exemptions)
         
         eff_percent = (operated_count_eff / assigned_count_eff * 100) if assigned_count_eff > 0 else 0
         if eff_percent >= e_up: eff_pen_const = 0
@@ -961,16 +975,26 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
         elif eff_percent >= e_bot: eff_pen_const = pen_low
         else: eff_pen_const = pen_low
         eff_penalty = missed_volume * eff_pen_const
-
-        operated_count_strict_bunching = max(0, operated_count_eff - penalized_bunched_trips)
-        missed_volume_strict_bunching = max(0, assigned_count_eff - operated_count_strict_bunching)
-        eff_percent_sb = (operated_count_strict_bunching / assigned_count_eff * 100) if assigned_count_eff > 0 else 0
         
         dist_factor = params["eff_pen_low"]
         if path_distances and normalize_path(directional_path) in path_distances:
             dist_factor = path_distances[normalize_path(directional_path)]
             
         eff_pen_const_sb = dist_factor
+        
+        # Calculate Base SB Penalty (Without Imputed Exemptions)
+        operated_count_strict_bunching_base = max(0, operated_count_eff - base_penalized_bunched_trips)
+        missed_volume_strict_bunching_base = max(0, assigned_count_eff - operated_count_strict_bunching_base)
+        base_eff_penalty_sb = missed_volume_strict_bunching_base * eff_pen_const_sb
+        
+        # Calculate Potential Savings mathematically
+        missed_vol_potential = max(0, assigned_count_eff - max(0, operated_count_eff - max(0, bunched_trips_count - extra_approved - potential_imputed_bunching_count)))
+        potential_imputed_bunching_savings = base_eff_penalty_sb - (missed_vol_potential * eff_pen_const_sb)
+
+        # Calculate Final SB Penalty (With any applied exemptions)
+        operated_count_strict_bunching = max(0, operated_count_eff - penalized_bunched_trips)
+        missed_volume_strict_bunching = max(0, assigned_count_eff - operated_count_strict_bunching)
+        eff_percent_sb = (operated_count_strict_bunching / assigned_count_eff * 100) if assigned_count_eff > 0 else 0
         eff_penalty_sb = missed_volume_strict_bunching * eff_pen_const_sb
         
         eff_details.append({
@@ -981,12 +1005,20 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
             "Strict Late Deductions": strict_late_deduction,
             "Net Operated Trips": operated_count_eff, "Volume Deficit": missed_volume, 
             "Uncovered Slots": uncovered_slots_count, "Bunched/Overlapped Trips": penalized_bunched_trips,
+            "Imputed Bunching Exemptions Applied": applied_bunching_exemptions,
             "Efficiency Achieved (%)": round(eff_percent, 2), "Penalty Factor": eff_pen_const, "Calculated Efficiency Penalty": eff_penalty
         })
         
-        on_time = group.loc[group['Punctuality_Status'] == "On-Time", 'Trip_Weight'].sum()
+        # === PUNCTUALITY AGGREGATION ===
+        on_time_base = group.loc[group['Punctuality_Status'] == "On-Time", 'Trip_Weight'].sum()
         early = group.loc[group['Punctuality_Status'] == "Early", 'Trip_Weight'].sum()
         late = group.loc[group['Punctuality_Status'] == "Late", 'Trip_Weight'].sum()
+        
+        ignored_punct_mask = group['Punctuality_Status'].str.contains('Excluded', na=False) & (group['Punctuality_Status'] != "Bunched (Excluded)")
+        punct_ignored_count = group.loc[ignored_punct_mask, 'Trip_Weight'].sum() if params.get("count_ignored") else 0
+        corr_counted_punct = corrections if params.get("count_corrections") else 0
+        
+        on_time = on_time_base + punct_ignored_count + corr_counted_punct
         off_time = early + late
         
         punct_evaluated_count = on_time + off_time
@@ -999,17 +1031,27 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
         punct_details.append({
             "Date": date_val, "Path": directional_path, "Total Evaluated Trips (Weighted)": punct_evaluated_count,
             "On-Time Trips": on_time, "Early Trips": early, "Late Trips": late, "Total Off-Time Trips": off_time,
+            "Ignored Counted Punctual": punct_ignored_count, "Corrections Counted Punctual": corr_counted_punct,
             "Punctuality Achieved (%)": round(punct_percent, 2), "Penalty Per Off-Time": punct_pen_const, "Calculated Punctuality Penalty": punct_penalty
         })
         
-        reg_eval_mask = group['Regularity_Status'].isin(["Regular", "Regular (Approved Fast)", "Too Fast", "Too Slow"])
-        reg_eval_count = group.loc[reg_eval_mask, 'Trip_Weight'].sum()
-        reg_regular_count = group.loc[group['Regularity_Status'].isin(["Regular", "Regular (Approved Fast)"]), 'Trip_Weight'].sum()
+        # === REGULARITY AGGREGATION ===
+        reg_eval_mask_base = group['Regularity_Status'].isin(["Regular", "Regular (Approved Fast)", "Too Fast", "Too Slow"])
+        reg_eval_count_base = group.loc[reg_eval_mask_base, 'Trip_Weight'].sum()
+        reg_regular_count_base = group.loc[group['Regularity_Status'].isin(["Regular", "Regular (Approved Fast)"]), 'Trip_Weight'].sum()
         reg_fast = group.loc[group['Regularity_Status'] == "Too Fast", 'Trip_Weight'].sum()
         reg_slow = group.loc[group['Regularity_Status'] == "Too Slow", 'Trip_Weight'].sum()
         off_reg = reg_fast + reg_slow
-        reg_rush_excluded = group.loc[group['Regularity_Status'] == "Rush Hour Excluded (Slow)", 'Trip_Weight'].sum()
+        
+        reg_rush_excluded = group.loc[group['Regularity_Status'].isin(["Rush Hour Excluded (Slow)", "Auto Rush Excluded (Slow)"]), 'Trip_Weight'].sum()
         reg_approved_fast = group.loc[group['Regularity_Status'] == "Regular (Approved Fast)", 'Trip_Weight'].sum()
+        
+        ignored_reg_mask = group['Regularity_Status'].str.contains('Excluded', na=False)
+        reg_ignored_count = group.loc[ignored_reg_mask, 'Trip_Weight'].sum() if params.get("count_ignored") else 0
+        corr_counted_reg = corrections if params.get("count_corrections") else 0
+        
+        reg_eval_count = reg_eval_count_base + reg_ignored_count + corr_counted_reg
+        reg_regular_count = reg_regular_count_base + reg_ignored_count + corr_counted_reg
         
         reg_percent = (reg_regular_count / reg_eval_count * 100) if reg_eval_count > 0 else 0
         if reg_percent >= r_up: r_pen_const = 0
@@ -1017,7 +1059,7 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
         else: r_pen_const = r_pen_const_val
         reg_penalty = off_reg * r_pen_const
 
-        valid_tt = group[reg_eval_mask].dropna(subset=['Actual_Travel_Time_Mins'])
+        valid_tt = group[reg_eval_mask_base].dropna(subset=['Actual_Travel_Time_Mins'])
         if not valid_tt.empty:
             max_idx = valid_tt['Actual_Travel_Time_Mins'].idxmax()
             min_idx = valid_tt['Actual_Travel_Time_Mins'].idxmin()
@@ -1033,6 +1075,7 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
             "Date": date_val, "Path": directional_path, "Total Evaluated Trips (Weighted)": reg_eval_count,
             "Regular Trips": reg_regular_count, "Too Fast Trips": reg_fast, "Too Slow Trips": reg_slow, "Total Irregular Trips": off_reg,
             "Rush Hour Excluded Trips": reg_rush_excluded, "Approved Fast Trips": reg_approved_fast,
+            "Ignored Counted Regular": reg_ignored_count, "Corrections Counted Regular": corr_counted_reg,
             "Daily Max Time (Mins)": daily_max, "Daily Max Tracking Link": daily_max_link,
             "Daily Min Time (Mins)": daily_min, "Daily Min Tracking Link": daily_min_link,
             "Daily Average Time (Mins)": daily_avg, "Path Overall Avg Time (Mins)": None, "Path Weekday Avg Time (Mins)": None,  
@@ -1048,12 +1091,18 @@ def process_file(file_obj, params, authoritative_dict, authoritative_times, inti
             "Bunched Trips": penalized_bunched_trips, "Approved Extra (Neg. Intimations)": extra_approved,
             "Efficiency (%)": round(eff_percent, 2), "Eff Penalty Factor": eff_pen_const, "Eff Penalty": eff_penalty,
             "Strict Bunching Net Operated": operated_count_strict_bunching, 
-            "Strict Bunching Eff (%)": round(eff_percent_sb, 2), "Strict Bunching Penalty": eff_penalty_sb,
+            "Strict Bunching Eff (%)": round(eff_percent_sb, 2), 
+            "Base Strict Bunching Penalty": base_eff_penalty_sb,
+            "Potential Imputed Bunching Savings": potential_imputed_bunching_savings,
+            "Imputed Bunching Exempted": applied_bunching_exemptions,
+            "Strict Bunching Penalty": eff_penalty_sb,
             "On-Time": on_time + extra_approved, "Off-Time": off_time, 
+            "Ignored Counted Punctual": punct_ignored_count, "Corrections Counted Punctual": corr_counted_punct,
             "Punctuality (%)": round((on_time + extra_approved) / (on_time + extra_approved + off_time) * 100 if (on_time + extra_approved + off_time) > 0 else 0, 2), 
             "Punct Penalty Factor": punct_pen_const, "Punct Penalty": punct_penalty,
             "Regularity (%)": round(reg_percent, 2), "Reg Penalty Factor": r_pen_const, "Reg Penalty": reg_penalty,
-            "Total Daily Penalty": eff_penalty + punct_penalty + reg_penalty
+            "Ignored Counted Regular": reg_ignored_count, "Corrections Counted Regular": corr_counted_reg,
+            "Total Daily Penalty": eff_penalty + eff_penalty_sb + punct_penalty + reg_penalty
         })
 
     return {
@@ -1175,6 +1224,9 @@ elif app_mode == "🛠️ Process New Data":
         with st.expander("Data Cleaning"):
             p_min_km = st.number_input("Minimum Valid REALIZED_KM", value=1.5)
             p_min_stops = st.number_input("Minimum Stop Count", value=5)
+            p_count_ignored = st.checkbox("Count Ignored Trips as Punctual/Regular", value=False)
+            p_count_corrections = st.checkbox("Count Master File Corrections as Punctual/Regular", value=False)
+            p_exempt_imputed_bunching = st.checkbox("Exempt Bunching Penalties caused by Imputed Trips", value=False)
 
     params = {
         "strict_eff": p_strict_eff, "eff_upper": p_eff_upper, "eff_target": p_eff_target, "eff_bottom": p_eff_bottom,
@@ -1184,7 +1236,9 @@ elif app_mode == "🛠️ Process New Data":
         "reg_bottom": p_reg_bottom, "reg_fast_pct": p_reg_fast_pct, "reg_slow_pct": p_reg_slow_pct, 
         "reg_imp_fast_pct": p_reg_imp_fast, "reg_imp_slow_pct": p_reg_imp_slow, "reg_pen": p_reg_pen,
         "auto_rush_enable": p_auto_rush, "auto_rush_thresh": p_auto_rush_thresh,
-        "min_km": p_min_km, "min_stops": p_min_stops, "run_sanity_checks": False
+        "min_km": p_min_km, "min_stops": p_min_stops, "count_ignored": p_count_ignored, "count_corrections": p_count_corrections, 
+        "exempt_imputed_bunching": p_exempt_imputed_bunching,
+        "run_sanity_checks": False
     }
 
     st.title("🛠️ Process Daily Kentkart Reports")
@@ -1212,12 +1266,17 @@ elif app_mode == "🛠️ Process New Data":
                     "OBU_SELECTION_ERRORS": [], "ASSIGNED_TRIPS": [], "ACCEPTED_TRIPS": [], "BUNCHED_TRIPS": [], "MISSED_TRIPS": [], 
                     "STRICT_EFFICIENCY_DEDUCTIONS": [], "AUTO_DETECTED_RUSH": [], "STIO_SANITY_CHECKS": [], "ON_TIME_TRIPS": [], "OFF_TIME_TRIPS": [], 
                     "REGULAR_TIME_TRIPS": [], "IRREGULAR_TIME_TRIPS": [], "IGNORED_TRIPS": [], "DATA_CLEANING_LOG": [], "INVALID_STOP_TIMES": [], 
-                    "PATH_STATISTICS": []
+                    "PATH_STATISTICS": [], "RUN_PARAMETERS": []
                 }
                 raw_master_data = {
                     "RAW_ON_TIME": [], "RAW_OFF_TIME": [], "RAW_REGULAR_TIME": [], "RAW_IRREGULAR_TIME": [], 
                     "RAW_ACCEPTED": [], "RAW_BUNCHED": [], "RAW_OBU_ERRORS": [], "RAW_STRICT_LATE": [], "RAW_CLEANING_LOG": [], "RAW_SANITY_CHECKS": []
                 }
+                
+                formatted_params = [{"Parameter": "Date of Generation", "Selected Value": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}]
+                for k, v in params.items():
+                    formatted_params.append({"Parameter": str(k).replace("_", " ").title(), "Selected Value": str(v)})
+                master_data["RUN_PARAMETERS"] = formatted_params
                 
                 for f in daily_files:
                     try:
@@ -1241,7 +1300,6 @@ elif app_mode == "🛠️ Process New Data":
                         master_data["PATH_STATISTICS"].extend(res.get("path_statistics_log", []))
                         master_data["IGNORED_TRIPS"].extend(res.get("ignored_trips", []))
                         
-                        # Only append impactful trips to the detail sheets
                         for trip in res.get("trips", []):
                             if trip["Status"] == "On-Time": master_data["ON_TIME_TRIPS"].append(trip)
                             elif trip["Status"] in ["Early", "Late"]: master_data["OFF_TIME_TRIPS"].append(trip)
@@ -1267,7 +1325,6 @@ elif app_mode == "🛠️ Process New Data":
                     status.update(label="No valid data processed.", state="error")
                     st.stop()
 
-                # --- Write to memory ---
                 status.write("Compiling files into memory...")
                 main_output = io.BytesIO()
                 raw_output = io.BytesIO()
@@ -1307,7 +1364,6 @@ elif app_mode == "🛠️ Process New Data":
                             if data: pd.DataFrame(data).to_excel(writer, sheet_name=sheet_name, index=False)
                         format_excel_output(writer)
                 
-                # === SAVE TO SESSION STATE ===
                 st.session_state.analysis_complete = True
                 st.session_state.main_excel = main_output.getvalue()
                 st.session_state.raw_excel = raw_output.getvalue() if opt_raw else None
@@ -1363,7 +1419,6 @@ if st.session_state.analysis_complete and app_mode != "ℹ️ About / Help":
         
         with tab1:
             if not df_kpi.empty:
-                # Format Dates for cleaner X-Axis
                 df_kpi['Date'] = pd.to_datetime(df_kpi['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
                 
                 unique_paths = sorted(df_kpi['Path'].astype(str).unique())
@@ -1379,7 +1434,7 @@ if st.session_state.analysis_complete and app_mode != "ℹ️ About / Help":
                                              text='Strict Bunching Eff (%)', title=f"Efficiency Trend: {selected_path}",
                                              color='Strict Bunching Eff (%)', color_continuous_scale="RdYlGn", range_color=[80, 100])
                             fig_eff.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
-                            fig_eff.update_layout(xaxis_type='category') # Forces discrete dates
+                            fig_eff.update_layout(xaxis_type='category')
                             st.plotly_chart(fig_eff, use_container_width=True)
                     with c2:
                         if "Punctuality (%)" in df_filtered.columns:
