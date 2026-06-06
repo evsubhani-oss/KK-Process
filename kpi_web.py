@@ -1224,9 +1224,9 @@ elif app_mode == "🛠️ Process New Data":
         with st.expander("Data Cleaning"):
             p_min_km = st.number_input("Minimum Valid REALIZED_KM", value=1.5)
             p_min_stops = st.number_input("Minimum Stop Count", value=5)
-            p_count_ignored = st.checkbox("Count Ignored Trips as Punctual/Regular", value=False)
-            p_count_corrections = st.checkbox("Count Master File Corrections as Punctual/Regular", value=False)
-            p_exempt_imputed_bunching = st.checkbox("Exempt Bunching Penalties caused by Imputed Trips", value=False)
+            p_count_ignored = st.checkbox("Count Ignored Trips as Punctual/Regular", value=True)
+            p_count_corrections = st.checkbox("Count Master File Corrections as Punctual/Regular", value=True)
+            p_exempt_imputed_bunching = st.checkbox("Exempt Bunching Penalties caused by Imputed Trips", value=True)
 
     params = {
         "strict_eff": p_strict_eff, "eff_upper": p_eff_upper, "eff_target": p_eff_target, "eff_bottom": p_eff_bottom,
